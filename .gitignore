@@ -70,10 +70,14 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+Contextdocuments/
+Utils/
 
 # PyBuilder
 .pybuilder/
 target/
+archive/
+lightrag_data/
 
 # Jupyter Notebook
 .ipynb_checkpoints

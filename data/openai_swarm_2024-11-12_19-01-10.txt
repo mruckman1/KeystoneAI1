@@ -1,0 +1,1046 @@
+# Repository: openai/swarm
+
+## Repository Structure
+
+```
+├── .pre-commit-config.yaml
+├── SECURITY.md
+├── assets/
+│   ├── diagram.png
+│   ├── logo.png
+│   └── swarm_diagram.png
+├── pyproject.toml
+├── setup.cfg
+├── swarm/
+│   ├── __init__.py
+│   ├── core.py
+│   ├── repl/
+│   │   ├── __init__.py
+│   │   └── repl.py
+│   ├── types.py
+│   └── util.py
+
+```
+
+## .pre-commit-config.yaml
+
+```
+repos:
+  - repo: https://github.com/hhatto/autopep8
+    rev: v2.1.0
+    hooks:
+      - id: autopep8
+        args:
+          - --in-place
+          - --aggressive
+
+```
+
+## SECURITY.md
+
+```
+# Security Policy
+
+For a more in-depth look at our security policy, please check out our [Coordinated Vulnerability Disclosure Policy](https://openai.com/security/disclosure/#:~:text=Disclosure%20Policy,-Security%20is%20essential&text=OpenAI%27s%20coordinated%20vulnerability%20disclosure%20policy,expect%20from%20us%20in%20return.).
+
+Our PGP key can located [at this address.](https://cdn.openai.com/security.txt)
+
+```
+
+## pyproject.toml
+
+```
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+```
+
+## setup.cfg
+
+```
+[metadata]
+name = swarm
+version = 0.1.0
+author = OpenAI Solutions
+description = A lightweight, stateless multi-agent orchestration framework.
+long_description = file: README.md
+long_description_content_type = text/markdown
+license = MIT
+
+[options]
+packages = find:
+zip_safe = True
+include_package_data = True
+install_requires =
+    numpy
+    openai>=1.33.0
+    pytest
+    requests
+    tqdm
+    pre-commit
+    instructor
+python_requires = >=3.10
+
+[tool.autopep8]
+max_line_length = 120
+ignore = E501,W6
+in-place = true
+recursive = true
+aggressive = 3
+
+```
+
+## swarm/__init__.py
+
+```
+from .core import Swarm
+from .types import Agent, Response
+
+__all__ = ["Swarm", "Agent", "Response"]
+
+```
+
+## swarm/core.py
+
+```
+# Standard library imports
+import copy
+import json
+from collections import defaultdict
+from typing import List, Callable, Union
+
+# Package/library imports
+from openai import OpenAI
+
+
+# Local imports
+from .util import function_to_json, debug_print, merge_chunk
+from .types import (
+    Agent,
+    AgentFunction,
+    ChatCompletionMessage,
+    ChatCompletionMessageToolCall,
+    Function,
+    Response,
+    Result,
+)
+
+__CTX_VARS_NAME__ = "context_variables"
+
+
+class Swarm:
+    def __init__(self, client=None):
+        if not client:
+            client = OpenAI()
+        self.client = client
+
+    def get_chat_completion(
+        self,
+        agent: Agent,
+        history: List,
+        context_variables: dict,
+        model_override: str,
+        stream: bool,
+        debug: bool,
+    ) -> ChatCompletionMessage:
+        context_variables = defaultdict(str, context_variables)
+        instructions = (
+            agent.instructions(context_variables)
+            if callable(agent.instructions)
+            else agent.instructions
+        )
+        messages = [{"role": "system", "content": instructions}] + history
+        debug_print(debug, "Getting chat completion for...:", messages)
+
+        tools = [function_to_json(f) for f in agent.functions]
+        # hide context_variables from model
+        for tool in tools:
+            params = tool["function"]["parameters"]
+            params["properties"].pop(__CTX_VARS_NAME__, None)
+            if __CTX_VARS_NAME__ in params["required"]:
+                params["required"].remove(__CTX_VARS_NAME__)
+
+        create_params = {
+            "model": model_override or agent.model,
+            "messages": messages,
+            "tools": tools or None,
+            "tool_choice": agent.tool_choice,
+            "stream": stream,
+        }
+
+        if tools:
+            create_params["parallel_tool_calls"] = agent.parallel_tool_calls
+
+        return self.client.chat.completions.create(**create_params)
+
+    def handle_function_result(self, result, debug) -> Result:
+        match result:
+            case Result() as result:
+                return result
+
+            case Agent() as agent:
+                return Result(
+                    value=json.dumps({"assistant": agent.name}),
+                    agent=agent,
+                )
+            case _:
+                try:
+                    return Result(value=str(result))
+                except Exception as e:
+                    error_message = f"Failed to cast response to string: {result}. Make sure agent functions return a string or Result object. Error: {str(e)}"
+                    debug_print(debug, error_message)
+                    raise TypeError(error_message)
+
+    def handle_tool_calls(
+        self,
+        tool_calls: List[ChatCompletionMessageToolCall],
+        functions: List[AgentFunction],
+        context_variables: dict,
+        debug: bool,
+    ) -> Response:
+        function_map = {f.__name__: f for f in functions}
+        partial_response = Response(
+            messages=[], agent=None, context_variables={})
+
+        for tool_call in tool_calls:
+            name = tool_call.function.name
+            # handle missing tool case, skip to next tool
+            if name not in function_map:
+                debug_print(debug, f"Tool {name} not found in function map.")
+                partial_response.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "tool_name": name,
+                        "content": f"Error: Tool {name} not found.",
+                    }
+                )
+                continue
+            args = json.loads(tool_call.function.arguments)
+            debug_print(
+                debug, f"Processing tool call: {name} with arguments {args}")
+
+            func = function_map[name]
+            # pass context_variables to agent functions
+            if __CTX_VARS_NAME__ in func.__code__.co_varnames:
+                args[__CTX_VARS_NAME__] = context_variables
+            raw_result = function_map[name](**args)
+
+            result: Result = self.handle_function_result(raw_result, debug)
+            partial_response.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "tool_name": name,
+                    "content": result.value,
+                }
+            )
+            partial_response.context_variables.update(result.context_variables)
+            if result.agent:
+                partial_response.agent = result.agent
+
+        return partial_response
+
+    def run_and_stream(
+        self,
+        agent: Agent,
+        messages: List,
+        context_variables: dict = {},
+        model_override: str = None,
+        debug: bool = False,
+        max_turns: int = float("inf"),
+        execute_tools: bool = True,
+    ):
+        active_agent = agent
+        context_variables = copy.deepcopy(context_variables)
+        history = copy.deepcopy(messages)
+        init_len = len(messages)
+
+        while len(history) - init_len < max_turns:
+
+            message = {
+                "content": "",
+                "sender": agent.name,
+                "role": "assistant",
+                "function_call": None,
+                "tool_calls": defaultdict(
+                    lambda: {
+                        "function": {"arguments": "", "name": ""},
+                        "id": "",
+                        "type": "",
+                    }
+                ),
+            }
+
+            # get completion with current history, agent
+            completion = self.get_chat_completion(
+                agent=active_agent,
+                history=history,
+                context_variables=context_variables,
+                model_override=model_override,
+                stream=True,
+                debug=debug,
+            )
+
+            yield {"delim": "start"}
+            for chunk in completion:
+                delta = json.loads(chunk.choices[0].delta.json())
+                if delta["role"] == "assistant":
+                    delta["sender"] = active_agent.name
+                yield delta
+                delta.pop("role", None)
+                delta.pop("sender", None)
+                merge_chunk(message, delta)
+            yield {"delim": "end"}
+
+            message["tool_calls"] = list(
+                message.get("tool_calls", {}).values())
+            if not message["tool_calls"]:
+                message["tool_calls"] = None
+            debug_print(debug, "Received completion:", message)
+            history.append(message)
+
+            if not message["tool_calls"] or not execute_tools:
+                debug_print(debug, "Ending turn.")
+                break
+
+            # convert tool_calls to objects
+            tool_calls = []
+            for tool_call in message["tool_calls"]:
+                function = Function(
+                    arguments=tool_call["function"]["arguments"],
+                    name=tool_call["function"]["name"],
+                )
+                tool_call_object = ChatCompletionMessageToolCall(
+                    id=tool_call["id"], function=function, type=tool_call["type"]
+                )
+                tool_calls.append(tool_call_object)
+
+            # handle function calls, updating context_variables, and switching agents
+            partial_response = self.handle_tool_calls(
+                tool_calls, active_agent.functions, context_variables, debug
+            )
+            history.extend(partial_response.messages)
+            context_variables.update(partial_response.context_variables)
+            if partial_response.agent:
+                active_agent = partial_response.agent
+
+        yield {
+            "response": Response(
+                messages=history[init_len:],
+                agent=active_agent,
+                context_variables=context_variables,
+            )
+        }
+
+    def run(
+        self,
+        agent: Agent,
+        messages: List,
+        context_variables: dict = {},
+        model_override: str = None,
+        stream: bool = False,
+        debug: bool = False,
+        max_turns: int = float("inf"),
+        execute_tools: bool = True,
+    ) -> Response:
+        if stream:
+            return self.run_and_stream(
+                agent=agent,
+                messages=messages,
+                context_variables=context_variables,
+                model_override=model_override,
+                debug=debug,
+                max_turns=max_turns,
+                execute_tools=execute_tools,
+            )
+        active_agent = agent
+        context_variables = copy.deepcopy(context_variables)
+        history = copy.deepcopy(messages)
+        init_len = len(messages)
+
+        while len(history) - init_len < max_turns and active_agent:
+
+            # get completion with current history, agent
+            completion = self.get_chat_completion(
+                agent=active_agent,
+                history=history,
+                context_variables=context_variables,
+                model_override=model_override,
+                stream=stream,
+                debug=debug,
+            )
+            message = completion.choices[0].message
+            debug_print(debug, "Received completion:", message)
+            message.sender = active_agent.name
+            history.append(
+                json.loads(message.model_dump_json())
+            )  # to avoid OpenAI types (?)
+
+            if not message.tool_calls or not execute_tools:
+                debug_print(debug, "Ending turn.")
+                break
+
+            # handle function calls, updating context_variables, and switching agents
+            partial_response = self.handle_tool_calls(
+                message.tool_calls, active_agent.functions, context_variables, debug
+            )
+            history.extend(partial_response.messages)
+            context_variables.update(partial_response.context_variables)
+            if partial_response.agent:
+                active_agent = partial_response.agent
+
+        return Response(
+            messages=history[init_len:],
+            agent=active_agent,
+            context_variables=context_variables,
+        )
+
+```
+
+## swarm/repl/__init__.py
+
+```
+from .repl import run_demo_loop
+
+```
+
+## swarm/repl/repl.py
+
+```
+import json
+
+from swarm import Swarm
+
+
+def process_and_print_streaming_response(response):
+    content = ""
+    last_sender = ""
+
+    for chunk in response:
+        if "sender" in chunk:
+            last_sender = chunk["sender"]
+
+        if "content" in chunk and chunk["content"] is not None:
+            if not content and last_sender:
+                print(f"\033[94m{last_sender}:\033[0m", end=" ", flush=True)
+                last_sender = ""
+            print(chunk["content"], end="", flush=True)
+            content += chunk["content"]
+
+        if "tool_calls" in chunk and chunk["tool_calls"] is not None:
+            for tool_call in chunk["tool_calls"]:
+                f = tool_call["function"]
+                name = f["name"]
+                if not name:
+                    continue
+                print(f"\033[94m{last_sender}: \033[95m{name}\033[0m()")
+
+        if "delim" in chunk and chunk["delim"] == "end" and content:
+            print()  # End of response message
+            content = ""
+
+        if "response" in chunk:
+            return chunk["response"]
+
+
+def pretty_print_messages(messages) -> None:
+    for message in messages:
+        if message["role"] != "assistant":
+            continue
+
+        # print agent name in blue
+        print(f"\033[94m{message['sender']}\033[0m:", end=" ")
+
+        # print response, if any
+        if message["content"]:
+            print(message["content"])
+
+        # print tool calls in purple, if any
+        tool_calls = message.get("tool_calls") or []
+        if len(tool_calls) > 1:
+            print()
+        for tool_call in tool_calls:
+            f = tool_call["function"]
+            name, args = f["name"], f["arguments"]
+            arg_str = json.dumps(json.loads(args)).replace(":", "=")
+            print(f"\033[95m{name}\033[0m({arg_str[1:-1]})")
+
+
+def run_demo_loop(
+    starting_agent, context_variables=None, stream=False, debug=False
+) -> None:
+    client = Swarm()
+    print("Starting Swarm CLI 🐝")
+
+    messages = []
+    agent = starting_agent
+
+    while True:
+        user_input = input("\033[90mUser\033[0m: ")
+        messages.append({"role": "user", "content": user_input})
+
+        response = client.run(
+            agent=agent,
+            messages=messages,
+            context_variables=context_variables or {},
+            stream=stream,
+            debug=debug,
+        )
+
+        if stream:
+            response = process_and_print_streaming_response(response)
+        else:
+            pretty_print_messages(response.messages)
+
+        messages.extend(response.messages)
+        agent = response.agent
+
+```
+
+## swarm/types.py
+
+```
+from openai.types.chat import ChatCompletionMessage
+from openai.types.chat.chat_completion_message_tool_call import (
+    ChatCompletionMessageToolCall,
+    Function,
+)
+from typing import List, Callable, Union, Optional
+
+# Third-party imports
+from pydantic import BaseModel
+
+AgentFunction = Callable[[], Union[str, "Agent", dict]]
+
+
+class Agent(BaseModel):
+    name: str = "Agent"
+    model: str = "gpt-4o"
+    instructions: Union[str, Callable[[], str]] = "You are a helpful agent."
+    functions: List[AgentFunction] = []
+    tool_choice: str = None
+    parallel_tool_calls: bool = True
+
+
+class Response(BaseModel):
+    messages: List = []
+    agent: Optional[Agent] = None
+    context_variables: dict = {}
+
+
+class Result(BaseModel):
+    """
+    Encapsulates the possible return values for an agent function.
+
+    Attributes:
+        value (str): The result value as a string.
+        agent (Agent): The agent instance, if applicable.
+        context_variables (dict): A dictionary of context variables.
+    """
+
+    value: str = ""
+    agent: Optional[Agent] = None
+    context_variables: dict = {}
+
+```
+
+## swarm/util.py
+
+```
+import inspect
+from datetime import datetime
+
+
+def debug_print(debug: bool, *args: str) -> None:
+    if not debug:
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message = " ".join(map(str, args))
+    print(f"\033[97m[\033[90m{timestamp}\033[97m]\033[90m {message}\033[0m")
+
+
+def merge_fields(target, source):
+    for key, value in source.items():
+        if isinstance(value, str):
+            target[key] += value
+        elif value is not None and isinstance(value, dict):
+            merge_fields(target[key], value)
+
+
+def merge_chunk(final_response: dict, delta: dict) -> None:
+    delta.pop("role", None)
+    merge_fields(final_response, delta)
+
+    tool_calls = delta.get("tool_calls")
+    if tool_calls and len(tool_calls) > 0:
+        index = tool_calls[0].pop("index")
+        merge_fields(final_response["tool_calls"][index], tool_calls[0])
+
+
+def function_to_json(func) -> dict:
+    """
+    Converts a Python function into a JSON-serializable dictionary
+    that describes the function's signature, including its name,
+    description, and parameters.
+
+    Args:
+        func: The function to be converted.
+
+    Returns:
+        A dictionary representing the function's signature in JSON format.
+    """
+    type_map = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+        type(None): "null",
+    }
+
+    try:
+        signature = inspect.signature(func)
+    except ValueError as e:
+        raise ValueError(
+            f"Failed to get signature for function {func.__name__}: {str(e)}"
+        )
+
+    parameters = {}
+    for param in signature.parameters.values():
+        try:
+            param_type = type_map.get(param.annotation, "string")
+        except KeyError as e:
+            raise KeyError(
+                f"Unknown type annotation {param.annotation} for parameter {param.name}: {str(e)}"
+            )
+        parameters[param.name] = {"type": param_type}
+
+    required = [
+        param.name
+        for param in signature.parameters.values()
+        if param.default == inspect._empty
+    ]
+
+    return {
+        "type": "function",
+        "function": {
+            "name": func.__name__,
+            "description": func.__doc__ or "",
+            "parameters": {
+                "type": "object",
+                "properties": parameters,
+                "required": required,
+            },
+        },
+    }
+
+```
+
+## Recent Issues (Past 3 Months)
+
+### Issue #54: Complementary to the LFAI and Data group's work on Interoperability.
+- **Created at**: 2024-10-12 16:00:40+00:00
+- **State**: open
+- **User**: industrialpoet
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 16:00:40+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+We have some common ground on the interoperation of multiple agents.
+https://github.com/open-voice-interoperability
+and specifically the working code sandbox at:
+https://github.com/open-voice-interoperability/open-voice-sandbox
+We last presented this work at the Grace Hopper event last week.
+
+
+
+### Issue #53: nit: typo in personal_shopper example
+- **Created at**: 2024-10-12 15:50:20+00:00
+- **State**: closed
+- **User**: thanos-wandb
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:13:32+00:00
+- **Last Updated**: 2024-10-15 04:13:32+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Fixes a minor typo in the main.py script within the personal_shopper example. No functional changes were made.
+
+### Issue #52: docs: update README.md
+- **Created at**: 2024-10-12 15:33:17+00:00
+- **State**: closed
+- **User**: eltociear
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:19:46+00:00
+- **Last Updated**: 2024-10-15 04:19:46+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+transfered -> transferred
+
+### Issue #51: [Nit] Fix a typo
+- **Created at**: 2024-10-12 13:23:18+00:00
+- **State**: closed
+- **User**: wi-ski
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:18:10+00:00
+- **Last Updated**: 2024-10-15 04:18:10+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Fixes a typo - 'differnt'/'different'
+
+### Issue #50: Notorious namesquatter is threatening legal action
+- **Created at**: 2024-10-12 11:58:03+00:00
+- **State**: open
+- **User**: endomorphosis
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 12:11:09+00:00
+- **Potential Pull Request Links**:
+- **Comments**:
+  - endomorphosis (2024-10-12 12:11:08+00:00): ![image](https://github.com/user-attachments/assets/0774616e-7df8-4174-ae1a-4994b2ee6452)
+
+- **Body**:
+Kye Gomez @kyegomez is threatening to sue openAI unless he is paid $10 million dollars for the use of the word "swarm" despite lying about owning the trademark, which is owned by some other company https://tsdr.uspto.gov/#caseNumber=87278643&caseSearchType=US_APPLICATION&caseType=DEFAULT&searchType=statusSearch
+
+[https://archive.ph/WU1Vs](https://t.co/CMmUZtaqdk)
+[https://archive.ph/XbZwI](https://t.co/uToWJHgFB8)
+![image](https://github.com/user-attachments/assets/39b60544-ff75-4b46-b046-83a7bc803781)
+![image](https://github.com/user-attachments/assets/536dc976-a186-42a3-96d8-2af361e6c045)
+
+He has previously also names quatted repositories named "sora" https://github.com/kyegomez/Sora, last year he was running bots to scrape microsoft bing image creator to re-serve requests against his own "unofficial" dalle3 API, and https://github.com/Agora-Lab-AI/Dalle3/blob/main/dalle3/dalle.py#L113, and has had numerous other complaints about name squatting see e.g. https://github.com/microsoft/unilm/issues/1182  https://github.com/pypi/support/issues/2928 https://www.reddit.com/r/MachineLearning/comments/15sq2v1/d_potential_scammer_on_github_stealing_work_of/
+
+He also ran a cryptocurrency scheme, purporting to pay people who contribute software services with crypto currency, sweepstakes scams pretending to give away A100s, statements that his company would be worth 100 trillion dollars by 2030, fake environmental carbon credit real estate holding company (before he got into AI). 
+
+I would very much appreciate it if someone from OpenAI's legal department, would reach out to the Maimi-Dade district attorney's office, to refer him for prosecution, because I am tired of the blight he continually brings to open source.
+
+### Issue #49: the class create_triage_agent from the swarm.agents module is missing.
+- **Created at**: 2024-10-12 09:08:45+00:00
+- **State**: open
+- **User**: jidechao
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 11:40:29+00:00
+- **Potential Pull Request Links**:
+- **Comments**:
+  - itsamziii (2024-10-12 11:40:15+00:00): The module `swarm. agents` needs to be implemented, it would contain some basic agents like sales agents, triage agents, etc. 
+- **Body**:
+In the Personal_shopper demo of the example, the class create_triage_agent from the swarm.agents module is missing.
+
+<img width="844" alt="企业微信截图_17287238754826" src="https://github.com/user-attachments/assets/8dfaa18d-f86a-4344-87e8-6b30d77a9770">
+
+### Issue #48: updated with llama examples including ollama wrapper
+- **Created at**: 2024-10-12 08:02:37+00:00
+- **State**: open
+- **User**: Arrabonae
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 14:43:56+00:00
+- **Potential Pull Request Links**:
+- **Comments**:
+  - iltranqui (2024-10-12 14:43:09+00:00): Sir, thank you very much for being this rapid to put this out. Will try it as soon as I can :) 
+  - 1327523532 (2024-10-12 14:43:55+00:00): 邮件已收到！祝您工作愉快！
+- **Body**:
+I have added a set of examples under the folder basic_llama. 
+These are the basic examples adopted and ran on llama3.2:3b locally. 
+
+### Issue #47: docs: fix typo
+- **Created at**: 2024-10-12 05:53:55+00:00
+- **State**: closed
+- **User**: yugasun
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:14:20+00:00
+- **Last Updated**: 2024-10-15 07:39:58+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+None
+
+### Issue #46: Allow setting client for run_demo_loop()
+- **Created at**: 2024-10-12 05:52:41+00:00
+- **State**: open
+- **User**: feiskyer
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 05:52:41+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Allow setting client for run_demo_loop(), so that customized client could be used there.
+
+### Issue #45: Use Assistant API instead 
+- **Created at**: 2024-10-12 05:32:47+00:00
+- **State**: open
+- **User**: zakir0101
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 05:34:48+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+How does this differ from **Assistant API** , except for the fact that : 
+- you have to manage and store conversation history manually.
+- you cannot use the **file search** tool.
+- you cannot use the **code interpreter** tool.
+
+[[ In That Assistant api you are allowed to use the same thread **(conversation)** with Multiple Assistant ( **Agent**) , just specify the desired Assistant Id when creating a new Run ( **Completion**)]]
+
+### Issue #44: adding type hints to functions
+- **Created at**: 2024-10-12 04:31:17+00:00
+- **State**: open
+- **User**: derekdeming
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 04:31:17+00:00
+- **Potential Pull Request Links**:
+  - Amazing work guys!! Seriously love the lightweight of this. Can't wait to build w/ it. Looks like one PR relating to the versioning (>=1.33) was made already. This simply adds type hints to a few functs which were missing them based on the provided table in the README
+- **Body**:
+Amazing work guys!! Seriously love the lightweight of this. Can't wait to build w/ it. Looks like one PR relating to the versioning (>=1.33) was made already. This simply adds type hints to a few functs which were missing them based on the provided table in the README
+
+### Issue #43: Update function example in README call greet instead of print_hello
+- **Created at**: 2024-10-12 03:41:12+00:00
+- **State**: open
+- **User**: METACOGNITIVE
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 03:41:12+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Obvious typo
+
+### Issue #42: Your brother project: GPTSwarm (https://github.com/metauto-ai/GPTSwarm)
+- **Created at**: 2024-10-12 03:19:48+00:00
+- **State**: open
+- **User**: mczhuge
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 04:59:06+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+**Dear Authors,**
+
+Thank you for sharing your work. Appreciate your contribution to the field. I’d like to bring your attention to a project that seems closely related to your research, which was released about 8 months prior to yours.
+
+**Project:** [https://gptswarm.org/](https://gptswarm.org/)  
+**Code:** [https://github.com/metauto-ai/GPTSwarm](https://github.com/metauto-ai/GPTSwarm)  
+**Paper:** [https://arxiv.org/abs/2402.16823](https://arxiv.org/abs/2402.16823) (ICML 2024, Oral Presentation)
+
+Additionally, I would personally suggest considering GPTSwarm's approach of **(1) constructing agents as graphs**. From there, you could focus on **(2) improving the swarm intelligence by improving these graphs, either through reinforcement learning or automated prompt improvement**, as outlined in our paper.
+
+In my experience, I believe this might be a visible and promising solution for LLM-based swarm intelligence (or MAS).
+
+Best regards,  
+Mingchen
+
+---
+
+References:
+
+🐝 **GPTSwarm is a graph-based framework for LLM-based agents, providing two high-level features:**
+
+* It lets you build LLM-based agents from graphs.
+* It enables the customized and automatic self-organization of agent swarms with self-improvement capabilities.
+
+## About GPTSwarm
+
+At a granular level, GPTSwarm is a library that includes the following components: 
+
+![image](https://github.com/user-attachments/assets/edc8a45c-19ef-4b7d-ab84-b7b805c51def)
+
+
+| Module | Description |
+| ---- | --- |
+| [**swarm.environment**](swarm/environment) | Domain-specific operations, agents, tools, and tasks |
+| [**swarm.graph**](swarm/graph) | Graph-related functions for creating and executing agent graphs and swarm composite graphs |
+| [**swarm.llm**](swarm/llm) | Interface for selecting LLM backends and calculating their operational costs |
+| [**swarm.memory**](swarm/memory) | Index-based memory |
+| [**swarm.optimizer**](swarm/optimizer) | Optimization algorithms designed to enhance agent performance and overall swarm efficiency |
+
+### Issue #41: fix requires openai==1.33
+- **Created at**: 2024-10-12 02:49:01+00:00
+- **State**: closed
+- **User**: lutzroeder
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:20:18+00:00
+- **Last Updated**: 2024-10-15 04:20:18+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Fix #40
+
+
+### Issue #40: Install downgrades openai package
+- **Created at**: 2024-10-12 02:45:26+00:00
+- **State**: closed
+- **User**: lutzroeder
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:20:19+00:00
+- **Last Updated**: 2024-10-15 04:20:19+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Running install removes current `openai==1.51.2` and installs `openai==1.33.0`.
+
+```bash
+~: pip install git+ssh://git@github.com/openai/swarm.git
+Collecting git+ssh://****@github.com/openai/swarm.git
+...
+Collecting openai==1.33.0 (from swarm==0.1.0)
+  Downloading openai-1.33.0-py3-none-any.whl.metadata (21 kB)
+Downloading openai-1.33.0-py3-none-any.whl (325 kB)
+Successfully built swarm
+Installing collected packages: openai, swarm
+  Attempting uninstall: openai
+    Found existing installation: openai 1.51.2
+    Uninstalling openai-1.51.2:
+      Successfully uninstalled openai-1.51.2
+Successfully installed openai-1.33.0 swarm-0.1.0
+```
+
+### Issue #39: fix: readme typo
+- **Created at**: 2024-10-12 01:49:18+00:00
+- **State**: closed
+- **User**: transitive-bullshit
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-15 04:15:53+00:00
+- **Last Updated**: 2024-10-15 04:15:53+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Looking at the code, it looks like this is a typo.
+
+Thanks 🙏 
+
+### Issue #38: indicate python 3.10+ required and alternate git install
+- **Created at**: 2024-10-12 01:26:03+00:00
+- **State**: closed
+- **User**: zzstoatzz
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-12 01:42:22+00:00
+- **Last Updated**: 2024-10-12 01:42:22+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+3.10+ `match` / `case` syntax is used in `Swarm.handle_function_result`
+
+### Issue #37: remove mutable default in `run_demo_loop`
+- **Created at**: 2024-10-12 00:49:34+00:00
+- **State**: closed
+- **User**: zzstoatzz
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: 2024-10-12 01:05:17+00:00
+- **Last Updated**: 2024-10-12 01:05:33+00:00
+- **Potential Pull Request Links**:
+- **Comments**:
+  - shyamal-anadkat (2024-10-12 01:05:32+00:00): thank you for your contribution @zzstoatzz!
+- **Body**:
+https://docs.python-guide.org/writing/gotchas/#mutable-default-arguments
+
+### Issue #36: The ssh install command won't work
+- **Created at**: 2024-10-12 00:43:43+00:00
+- **State**: open
+- **User**: pipinstallyp
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 01:59:42+00:00
+- **Potential Pull Request Links**:
+- **Comments**:
+  - iam-abbas (2024-10-12 00:58:06+00:00): You probably have not yet setup SSH key with your Github.
+
+https://docs.github.com/en/authentication/connecting-to-github-with-ssh
+  - zzstoatzz (2024-10-12 01:59:41+00:00): fwiw @pipinstallyp https://github.com/openai/swarm/pull/38 addresses this in the readme
+    - Potential PR Link: fwiw @pipinstallyp https://github.com/openai/swarm/pull/38 addresses this in the readme
+- **Body**:
+Tried installing the package using pip install git+ssh://git@github.com/openai/swarm.git, but seems like with ssh it's not working.  Though pip install git+https://github.com/openai/swarm.git worked. 
+
+
+```
+Collecting git+ssh://****@github.com/openai/swarm.git
+  Cloning ssh://****@github.com/openai/swarm.git to c:\users\peepsies\appdata\local\temp\pip-req-build-fdnqapav
+  Running command git clone --filter=blob:none --quiet 'ssh://****@github.com/openai/swarm.git' 'C:\Users\PEEPSIES\AppData\Local\Temp\pip-req-build-fdnqapav'
+  git@github.com: Permission denied (publickey).
+  fatal: Could not read from remote repository.
+
+  Please make sure you have the correct access rights
+  and the repository exists.
+  error: subprocess-exited-with-error
+
+  × git clone --filter=blob:none --quiet 'ssh://****@github.com/openai/swarm.git' 'C:\Users\PEEPSIES\AppData\Local\Temp\pip-req-build-fdnqapav' did not run successfully.
+  │ exit code: 128
+  ╰─> See above for output.
+
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: subprocess-exited-with-error
+
+× git clone --filter=blob:none --quiet 'ssh://****@github.com/openai/swarm.git' '/tmp/pip-req-build-fo6sk5yw' did not run successfully.
+│ exit code: 128
+╰─> See above for output.
+
+```
+
+### Issue #35: Hugging face and langchain models support
+- **Created at**: 2024-10-12 00:34:20+00:00
+- **State**: open
+- **User**: Islam231bi
+- **Labels**: []
+- **Assignees**: None
+- **Milestone**: None
+- **Closed at**: Still open
+- **Last Updated**: 2024-10-12 08:06:14+00:00
+- **Potential Pull Request Links**:
+- **Comments**:
+  - ifromeast (2024-10-12 08:06:13+00:00): same problem
+- **Body**:
+Does it support other models from hugging face, langchain, together, ... or only openai ?
+
+### Issue #34: Rename all instances of Assistant to Agent - except Assistants API
+- **Created at**: 2024-10-10 20:08:29+00:00
+- **State**: closed
+- **User**: ibigio
+- **Labels**: []
+- **Assignees**: ['jhills20']
+- **Milestone**: None
+- **Closed at**: 2024-10-10 20:13:40+00:00
+- **Last Updated**: 2024-10-10 20:13:48+00:00
+- **Potential Pull Request Links**:
+- **Body**:
+Renamed Assistants to Agents to avoid confusing with the Assistants API. [thread](https://openai.slack.com/archives/CNFF28BKL/p1724816956439139?thread_ts=1724780831.807739&cid=CNFF28BKL)
+All occurrences:
+- in dir names
+- in file names
+- inside files
+
+Tests all pass.
+
