@@ -52,14 +52,22 @@ st.title("LightRAG Query App")
 st.markdown("Enter a query to get answers from your knowledge base.")
 
 # Input for the user's query
-user_query = st.text_input("Your Query:", "Which Keystone employees would be best positioned to resolve the GitHub issues found?")
+user_query = st.text_input("Your Query:", "Who is the cofounder and chairman of the board for Keystone AI?")
+
+# Select box for search mode
+search_mode = st.selectbox(
+    "Search Mode:",
+    options=["global", "local"],
+    index=0  # Default to global
+)
 
 # Button to submit the query
 if st.button("Submit"):
     try:
-        query_param = QueryParam(mode="global")
+        query_param = QueryParam(mode=search_mode)
         response = rag.query(user_query, param=query_param)
         logging.info(f"Query: {user_query}")
+        logging.info(f"Search Mode: {search_mode}")
         logging.info(f"Response: {response}")
         st.success("Query Response:")
         st.write(response)
